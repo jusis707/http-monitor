@@ -19,27 +19,78 @@ log_message() {
     echo "$(date '+%Y-%m-%d %H:%M:%S'): $1" >> "${LOG_FILE}"
 }
 
+DEFAULT_CURL_TIMEOUT=5            # seconds for each individual curl attempt
+DEFAULT_RETRY_ATTEMPTS=3          # how many times to retry on failure
+DEFAULT_RETRY_DELAY=2             # seconds delay between retries
+DEFAULT_REQUIRED_FAILURES=3       # how many consecutive failures indicate stable offline
+
+log_message() {
+    echo "$(date '+%Y-%m-%d %H:%M:%S') - $1"
+}
+
 check_https() {
     local host=$1
-    log_message "Checking HTTPS for ${host}..."
-    HTTP_CODE=$(curl -k -s -o /dev/null -w "%{http_code}" --max-time "${CURL_TIMEOUT}" "https://${host}/")
-    CURL_EXIT_CODE=$?
+    local curl_timeout="${CURL_TIMEOUT:-$DEFAULT_CURL_TIMEOUT}"
+    local retry_attempts="${RETRY_ATTEMPTS:-$DEFAULT_RETRY_ATTEMPTS}"
+    local retry_delay="${RETRY_DELAY:-$DEFAULT_RETRY_DELAY}"
+    local required_failures="${REQUIRED_FAILURES:-$DEFAULT_REQUIRED_FAILURES}"
+    local consecutive_failures=0
+    local result_message=""
 
-    if [ ${CURL_EXIT_CODE} -eq 0 ]; then
-        if [ "${HTTP_CODE}" -ge 200 ] && [ "${HTTP_CODE}" -lt 500 ]; then
-            echo "HTTPS_OK(${HTTP_CODE})"
+    log_message "Starting HTTPS stability check for ${host}..."
+    log_message "  Curl Timeout per attempt: ${curl_timeout}s"
+    log_message "  Max Retry Attempts: ${retry_attempts}"
+    log_message "  Delay between Retries: ${retry_delay}s"
+    log_message "  Required Consecutive Failures for 'stable offline': ${required_failures}"
+
+    for (( i=1; i<=retry_attempts; i++ )); do
+        log_message "  Attempt ${i}/${retry_attempts} for ${host}..."
+        HTTP_CODE=$(curl -k -s -o /dev/null -w "%{http_code}" --max-time "${curl_timeout}" "https://${host}/")
+        CURL_EXIT_CODE=$?
+
+        if [ ${CURL_EXIT_CODE} -eq 0 ]; then
+            if [ "${HTTP_CODE}" -ge 200 ] && [ "${HTTP_CODE}" -lt 500 ]; then
+                log_message "  Attempt ${i}: HTTPS_OK (HTTP ${HTTP_CODE})"
+                consecutive_failures=0 # Reset on success
+                result_message="HTTPS_OK(STABLE - ${HTTP_CODE})"
+                break # Exit loop on first successful check
+            else
+                log_message "  Attempt ${i}: HTTPS_FAIL (HTTP ${HTTP_CODE})"
+                consecutive_failures=$((consecutive_failures + 1))
+                result_message="HTTPS_FAIL(UNSTABLE - HTTP ${HTTP_CODE})"
+            fi
         else
-            echo "HTTPS_FAIL(${HTTP_CODE})"
+            case ${CURL_EXIT_CODE} in
+                28)
+                    log_message "  Attempt ${i}: HTTPS_FAIL (TIMEOUT)"
+                    result_message="HTTPS_FAIL(UNSTABLE - TIMEOUT)"
+                    ;;
+                6)
+                    log_message "  Attempt ${i}: HTTPS_FAIL (DNS_FAIL_OR_CONN_REFUSED)"
+                    result_message="HTTPS_FAIL(UNSTABLE - DNS_FAIL_OR_CONN_REFUSED)"
+                    ;;
+                *)
+                    log_message "  Attempt ${i}: HTTPS_FAIL (CURL_ERROR_${CURL_EXIT_CODE})"
+                    result_message="HTTPS_FAIL(UNSTABLE - CURL_ERROR_${CURL_EXIT_CODE})"
+                    ;;
+            esac
+            consecutive_failures=$((consecutive_failures + 1))
         fi
-    else
-        if [ ${CURL_EXIT_CODE} -eq 28 ]; then
-            echo "HTTPS_FAIL(TIMEOUT)"
-        elif [ ${CURL_EXIT_CODE} -eq 6 ]; then
-            echo "HTTPS_FAIL(DNS_FAIL_OR_CONN_REFUSED)"
-        else
-            echo "HTTPS_FAIL(CURL_ERROR_${CURL_EXIT_CODE})"
+
+        if [ ${consecutive_failures} -ge ${required_failures} ]; then
+            log_message "  Confirmed ${required_failures} consecutive failures. Declaring stable offline."
+            result_message="HTTPS_FAIL(STABLE_OFFLINE - ${consecutive_failures} CONSECUTIVE_FAILURES)"
+            break # Exit if stable offline is confirmed
         fi
-    fi
+
+        if [ ${i} -lt ${retry_attempts} ]; then
+            local actual_delay=$(( retry_delay + RANDOM % 2 )) # Add a small random jitter (+0 or +1 second)
+            log_message "  Waiting ${actual_delay}s before next attempt..."
+            sleep "${actual_delay}"
+        fi
+    done
+
+    echo "${result_message}"
 }
 
 send_api_email() {
